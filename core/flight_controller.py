@@ -67,11 +67,13 @@ class FlightController:
 
     # --------------------------------------------------
     def fly_to(self, tgt_lat, tgt_lon, tgt_alt):
-        """Hedef koordinata tek bir NAV döngüsü (eski döngüyü iptal eder)."""
+        """Hedef koordinata tekil NAV döngüsüyle uç."""
+        # — Eski NAV döngüsü çalışıyorsa durdur
         if self.nav_thread and self.nav_thread.is_alive():
             self.nav_stop.set()
             self.nav_thread.join()
 
+        # Yeni NAV thread’i başlat
         self.nav_stop.clear()
         self.nav_thread = threading.Thread(
             target=self._nav_loop,
@@ -79,6 +81,80 @@ class FlightController:
             daemon=True
         )
         self.nav_thread.start()
+
+    def fly_scenario(self, waypoints):
+    
+        if self.nav_thread and self.nav_thread.is_alive():
+            self.nav_stop.set()
+            self.nav_thread.join()
+
+        self.nav_stop.clear()
+        self.nav_thread = threading.Thread(
+            target=self._scenario_loop,
+            args=(waypoints,),
+            daemon=True
+        )
+        self.nav_thread.start()
+
+    def _scenario_loop(self, waypoints):
+        try:
+            self.set_status("📍 Senaryo uçuşu başlatıldı...")
+            for idx, wp in enumerate(waypoints):
+                tgt_lat = wp["lat"]
+                tgt_lon = wp["lon"]
+                tgt_alt = wp["alt"]
+                tgt_spd = wp.get("spd", 100)
+
+                self.set_status(f"🎯 Hedef {idx+1}/{len(waypoints)} → LAT:{tgt_lat}, LON:{tgt_lon}, ALT:{tgt_alt}, SPD:{tgt_spd}")
+
+                if self.ae.find("AP_MASTER"):
+                    self.ae.find("AP_MASTER")()
+                if self.ae.find("AP_HDG_HOLD_ON"):
+                    self.ae.find("AP_HDG_HOLD_ON")()
+
+                if self.ae.find("AP_SPD_VAR_SET"):
+                    self.ae.find("AP_SPD_VAR_SET")(int(tgt_spd))
+
+                while not self.nav_stop.is_set():
+                    cur_lat = self.aq.get("PLANE_LATITUDE")
+                    cur_lon = self.aq.get("PLANE_LONGITUDE")
+                    cur_alt = self.aq.get("PLANE_ALTITUDE")
+
+                    dist_nm = _haversine_nm(cur_lat, cur_lon, tgt_lat, tgt_lon)
+                    alt_err = tgt_alt - cur_alt
+
+                    if dist_nm < 0.3:
+                        self.set_status(f"✅ Hedef {idx+1} ulaşıldı!")
+                        break
+
+                    brg = _bearing(cur_lat, cur_lon, tgt_lat, tgt_lon)
+
+                    # ✅ Yönü ve HDG modunu sürekli güncelle
+                    if self.ae.find("HEADING_BUG_SET"):
+                        self.ae.find("HEADING_BUG_SET")(int(brg))
+                    if self.ae.find("AP_HDG_HOLD_ON"):
+                        self.ae.find("AP_HDG_HOLD_ON")()
+
+                    # VS (vertical speed) hesaplama ve uygulama
+                    vs_cmd = 0
+                    if abs(alt_err) > 20:
+                        vs_cmd = max(min(alt_err * 1.5, 500), -500)
+                    if self.ae.find("AP_ALT_VAR_SET_ENGLISH"):
+                        self.ae.find("AP_ALT_VAR_SET_ENGLISH")(int(tgt_alt))
+                    if vs_cmd and self.ae.find("AP_VS_SET_ENGLISH"):
+                        self.ae.find("AP_VS_SET_ENGLISH")(int(vs_cmd))
+
+                    self.set_status(
+                        f"🛫 {idx+1}. Hedefe Gidiliyor → Dist:{dist_nm:.1f} NM | AltFark:{alt_err:.0f} ft | BRG:{brg:.0f}°"
+                    )
+                    time.sleep(1)
+
+            self.set_status("🏁 Senaryo tamamlandı.")
+            if self.ae.find("AP_VS_SET_ENGLISH"):
+                self.ae.find("AP_VS_SET_ENGLISH")(0)
+        except Exception as e:
+            self.set_status(f"❌ Senaryo NAV hatası: {e}")
+
 
     # --------------------------------------------------
     def _nav_loop(self, tgt_lat, tgt_lon, tgt_alt):
@@ -89,37 +165,38 @@ class FlightController:
             ae.find("AP_HDG_HOLD_ON")()
 
             while not self.nav_stop.is_set():
-                cur_lat = aq.get("PLANE_LATITUDE")
-                cur_lon = aq.get("PLANE_LONGITUDE")
-                cur_alt = aq.get("PLANE_ALTITUDE")
+                cur_lat = self.aq.get("PLANE_LATITUDE")
+                cur_lon = self.aq.get("PLANE_LONGITUDE")
+                cur_alt = self.aq.get("PLANE_ALTITUDE")
 
                 dist_nm = _haversine_nm(cur_lat, cur_lon, tgt_lat, tgt_lon)
                 alt_err = tgt_alt - cur_alt
 
-                # Hedefe ulaşıldı mı?
-                if dist_nm < 0.5 and abs(alt_err) < 50:
-                    self.set_status("🎯 Hedefe ulaşıldı!")
+                if dist_nm < 0.3:
+                    self.set_status(f"✅ Hedef {idx+1} ulaşıldı!")
                     break
-
-                # --- Heading kontrolü ---
+                
                 brg = _bearing(cur_lat, cur_lon, tgt_lat, tgt_lon)
-                ae.find("HEADING_BUG_SET")(int(brg))
+                self.ae.find("HEADING_BUG_SET")(int(brg))
+                
 
-                # --- İrtifa kontrolü (yumuşatılmış) ---
                 vs_cmd = 0
                 if abs(alt_err) > 20:
                     vs_cmd = max(min(alt_err * 1.5, 500), -500)
-                ae.find("AP_ALT_VAR_SET_ENGLISH")(int(tgt_alt))
-                if vs_cmd and ae.find("AP_VS_SET_ENGLISH"):
-                    ae.find("AP_VS_SET_ENGLISH")(int(vs_cmd))
+
+                self.ae.find("AP_ALT_VAR_SET_ENGLISH")(int(tgt_alt))
+                if vs_cmd and self.ae.find("AP_VS_SET_ENGLISH"):
+                    self.ae.find("AP_VS_SET_ENGLISH")(int(vs_cmd))
 
                 self.set_status(
-                    f"🛫 Dist:{dist_nm:.1f} NM | AltFark:{alt_err:.0f} ft | BRG:{brg:.0f}° | Konum : {cur_lat}  , {cur_lon}"
+                    f"🛫 {idx+1}. Hedefe Gidiliyor → Dist:{dist_nm:.1f} NM | AltFark:{alt_err:.0f} ft | BRG:{brg:.0f}°"
                 )
                 time.sleep(1)
+
 
             # Döngüden çıkarken VS'yi sıfırla
             if ae.find("AP_VS_SET_ENGLISH"):
                 ae.find("AP_VS_SET_ENGLISH")(0)
         except Exception as e:
             self.set_status(f"❌ NAV hata: {e}")
+
