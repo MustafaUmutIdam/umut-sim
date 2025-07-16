@@ -41,22 +41,82 @@ class FlightController:
             self.nav_stop.set()
             self.nav_thread.join()
 
-    def teleport(self, lat, lon, alt, spd, hdg):
+    def teleport(self, lat, lon, alt, spd, hdg=None, step_m=5):
+        """
+        Hedefe kademeli ‘ışınlama’: her saniye ≈ step_m metre.
+        • lat, lon, alt : hedef konum
+        • spd          : uçuş hızı (otopilot için)
+        • hdg=None     : ilk adımda zorla heading -> otomatik hesap; elle verirsen bu kullanılır
+        • step_m       : yatay adım (metre)
+        """
         try:
-            self.aq.set("PLANE_LATITUDE", lat)
-            self.aq.set("PLANE_LONGITUDE", lon)
-            self.aq.set("PLANE_ALTITUDE", alt)
-            self.aq.set("PLANE_HEADING_DEGREES_TRUE", hdg)
-            self._ev("HEADING_BUG_SET", int(hdg))
-            self._ev("AP_MASTER")
-            self._ev("AP_HDG_HOLD_ON")
-            self._ev("AP_ALT_VAR_SET_ENGLISH", int(alt))
-            self._ev("AP_VS_SET_ENGLISH", 0)
-            self._ev("THROTTLE_AXIS_SET_EX1", 8192)
-            self._ev("AP_SPD_VAR_SET", int(spd))
-            self._ev("AP_AUTOTHROTTLE_ARM")
+            # --- Mevcut konum / irtifa ---
+            cur_lat = self.aq.get("PLANE_LATITUDE")
+            cur_lon = self.aq.get("PLANE_LONGITUDE")
+            cur_alt = self.aq.get("PLANE_ALTITUDE")
 
-            self._status(f"📍 Işınlandı → LAT {lat:.4f}  LON {lon:.4f}  ALT {alt}  SPD {spd}")
+            if None in (cur_lat, cur_lon, cur_alt):
+                self._status("❌ Sim verisi alınamadı.")
+                return
+
+            # --- Bearing & toplam mesafe (metre) ---
+            bearing_deg = _bearing(cur_lat, cur_lon, lat, lon)
+            total_nm    = _haversine_nm(cur_lat, cur_lon, lat, lon)
+            total_m     = total_nm * 1852.0
+            alt_diff    = alt - cur_alt
+            steps       = max(1, int(total_m // step_m))
+
+            # Bir adımda kaç derece gidilecek? (yaklaşık)
+            def meters_to_deg_lat(m):  return m / 111_111.0
+            def meters_to_deg_lon(m, latitude):
+                return m / (111_111.0 * math.cos(math.radians(latitude)))
+
+            d_lat_per = meters_to_deg_lat(step_m * math.cos(math.radians(bearing_deg)))
+            d_lon_per = meters_to_deg_lon(step_m * math.sin(math.radians(bearing_deg)), cur_lat)
+            d_alt_per = alt_diff / steps if steps else 0.0
+
+            self._status(f"🚀 Kademeli ışınlama → {steps} adım, ~{step_m} m/step")
+
+            # Otomatik heading: ilk adımda ayarla
+            first_hdg = int(hdg if hdg is not None else bearing_deg)
+            self._ev("HEADING_BUG_SET", first_hdg)
+            self._ev("AP_HDG_HOLD_ON")
+
+            # ---- Adım döngüsü (ayrı thread) ----
+            def _step_loop():
+                nonlocal cur_lat, cur_lon, cur_alt
+                for i in range(steps):
+                    if self.nav_stop.is_set():
+                        break
+
+                    cur_lat += d_lat_per
+                    cur_lon += d_lon_per
+                    cur_alt += d_alt_per
+
+                    self.aq.set("PLANE_LATITUDE",  cur_lat)
+                    self.aq.set("PLANE_LONGITUDE", cur_lon)
+                    self.aq.set("PLANE_ALTITUDE",  cur_alt)
+
+                    self._ev("AP_ALT_VAR_SET_ENGLISH", int(cur_alt))
+                    self._status(f"📍 Step {i+1}/{steps}  LAT:{cur_lat:.6f}  LON:{cur_lon:.6f}  ALT:{cur_alt:.1f}")
+                    time.sleep(0.1)
+
+                # Son değerleri hedefe eşitle
+                self.aq.set("PLANE_LATITUDE",  lat)
+                self.aq.set("PLANE_LONGITUDE", lon)
+                self.aq.set("PLANE_ALTITUDE",  alt)
+                self._status("✅ Işınlama tamamlandı.")
+
+                # Seyir parametreleri
+                self._ev("AP_MASTER")
+                self._ev("AP_ALT_VAR_SET_ENGLISH", int(alt))
+                self._ev("AP_VS_SET_ENGLISH", 0)
+                self._ev("AP_SPD_VAR_SET", int(spd))
+                self._ev("AP_AUTOTHROTTLE_ARM")
+                self._ev("THROTTLE_AXIS_SET_EX1", 8192)
+
+            threading.Thread(target=_step_loop, daemon=True).start()
+
         except Exception as e:
             self._status(f"❌ Işınlama hatası: {e}")
 
