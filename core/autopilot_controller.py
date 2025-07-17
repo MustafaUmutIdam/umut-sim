@@ -57,6 +57,10 @@ class AutopilotController:
                         ev(0)
                     break
                 time.sleep(1)
+                
+            # VS’yi 0’a çektikten hemen sonra:
+            if ev := self.ae.find("AP_ALT_HOLD_OFF"):
+                ev()                       # ✱ ALT kilidini kapat
             
                 
 
