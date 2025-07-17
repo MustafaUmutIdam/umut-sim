@@ -41,6 +41,53 @@ class FlightController:
             self.nav_stop.set()
             self.nav_thread.join()
 
+
+    def follow_stream(self, stream, interval=0.1):
+        self.stop_nav()
+        self.nav_stop.clear()
+        self._status("📡 Veri takibi başladı…")
+
+        def _loop():
+            try:
+                self._ev("AP_MASTER_OFF")
+
+                for frame in stream:
+                    if self.nav_stop.is_set():
+                        break
+
+                    lat = frame.get("lat")
+                    lon = frame.get("lon")
+                    alt = frame.get("alt")
+                    hdg = frame.get("heading_deg")
+                    pitch = frame.get("pitch_deg") or frame.get("pitch")
+                    roll  = frame.get("roll_deg")  or frame.get("bank") or frame.get("roll")
+                    yaw   = frame.get("yaw_deg")
+
+                    # Pozisyon
+                    if lat is not None: self.aq.set("PLANE_LATITUDE", lat)
+                    if lon is not None: self.aq.set("PLANE_LONGITUDE", lon)
+                    if alt is not None: self.aq.set("PLANE_ALTITUDE", alt)
+
+                    if hdg is not None:
+                        print(f"Trying to set heading to {hdg}")
+                        hdg_deg = frame["heading_deg"]
+                        hdg_rad = math.radians(hdg_deg) * 366 / 360
+                        self._ev("HEADING_BUG_SET", int(hdg))
+                        self.aq.set("PLANE_HEADING_DEGREES_TRUE", hdg_rad) # Asıl heading set 
+                        print(f"Trying to set heading to {hdg_rad}")
+
+                        
+                    self._status(
+                        f"📡 LAT {lat:.4f} LON {lon:.4f} ALT {alt} HDG {hdg}"
+                    )
+                    time.sleep(interval)
+
+                self._status("✅ Veri takibi bitti.")
+            except Exception as e:
+                self._status(f"❌ Veri takibi hata: {e}")
+
+        threading.Thread(target=_loop, daemon=True).start()
+
     def teleport(self, lat, lon, alt, spd, hdg=None, step_m=5):
         """
         Hedefe kademeli ‘ışınlama’: her saniye ≈ step_m metre.
@@ -120,14 +167,13 @@ class FlightController:
         except Exception as e:
             self._status(f"❌ Işınlama hatası: {e}")
 
-    def fly_to(self, lat, lon, alt):
+    def fly_to(self, lat, lon, alt, spd):
+        self._ev("AP_ALT_HOLD_OFF")
         self.stop_nav()
         self.nav_stop.clear()
-        self._prepare_autopilot(lat, lon, alt)
-
-        # 0.5 saniye sonra tekrar uygula
-        threading.Timer(0.5, lambda: self._prepare_autopilot(lat, lon, alt)).start()
-
+        self._prepare_autopilot(lat, lon, alt, spd)                # ✱ spd ile
+        
+        threading.Timer(0.5, lambda: self._prepare_autopilot(lat, lon, alt, spd)).start()
         self.nav_thread = threading.Thread(
             target=self._nav_loop, args=(lat, lon, alt), daemon=True
         )
@@ -147,21 +193,28 @@ class FlightController:
         )
         self.nav_thread.start()
 
-    def _prepare_autopilot(self, tgt_lat, tgt_lon, tgt_alt, tgt_spd=90):
+    def _prepare_autopilot(self, tgt_lat, tgt_lon, tgt_alt, tgt_spd):
+        self._ev("AP_ALT_HOLD_OFF")
+
         cur_lat = self.aq.get("PLANE_LATITUDE") or 0.0
         cur_lon = self.aq.get("PLANE_LONGITUDE") or 0.0
-        brg = _bearing(cur_lat, cur_lon, tgt_lat, tgt_lon)
+        cur_alt = self.aq.get("PLANE_ALTITUDE")   or 0.0
+        brg     = _bearing(cur_lat, cur_lon, tgt_lat, tgt_lon)
+        alt_err = tgt_alt - cur_alt
 
         self._ev("AP_MASTER")
         self._ev("HEADING_BUG_SET", int(brg))
-        self._ev("AP_HDG_HOLD_OFF")
-        time.sleep(0.05)
-        self._ev("AP_HDG_HOLD_ON")
+        self._ev("AP_HDG_HOLD_OFF"); time.sleep(0.05); self._ev("AP_HDG_HOLD_ON")
 
+        # ---- dikey profil ----
         self._ev("AP_ALT_VAR_SET_ENGLISH", int(tgt_alt))
-        self._ev("AP_VS_SET_ENGLISH", 0)
-        self._ev("AP_SPD_VAR_SET", int(tgt_spd))
+        initial_vs = 800 if alt_err > 0 else -800          # ±800 ft/dk
+        self._ev("AP_VS_SET_ENGLISH", initial_vs)
 
+        # ---- hız ----
+        self._ev("AP_SPD_VAR_SET", int(tgt_spd))           # ✱ hedef hız
+
+        # trim / throttle
         self.aq.set("FLAPS_HANDLE_PERCENT", 0)
         self.aq.set("ELEVATOR_TRIM_POSITION", 0)
         self._ev("THROTTLE_AXIS_SET_EX1", 8192)
@@ -200,6 +253,9 @@ class FlightController:
                 self._status(
                     f"🛫 NAV → Dist {dist_nm:.2f} NM  AltFark {alt_err:.0f} ft  BRG {brg:.0f}°"
                 )
+
+                if abs(alt_err) < 100 and abs(dist_nm) < 3:
+                    self._ev("AP_ALT_HOLD_ON")
                 time.sleep(1)
 
             self._ev("AP_VS_SET_ENGLISH", 0)
@@ -224,7 +280,8 @@ class FlightController:
 
                 self._prepare_autopilot(tgt_lat, tgt_lon, tgt_alt, tgt_spd)
                 # 0.5 saniye sonra tekrar uygula
-                threading.Timer(0.5, lambda: self._prepare_autopilot(tgt_lat, tgt_lon, tgt_alt, tgt_spd)).start()
+                threading.Timer(0.5, lambda lat=tgt_lat, lon=tgt_lon, alt=tgt_alt, spd=tgt_spd:
+                self._prepare_autopilot(lat, lon, alt, spd)).start()
 
                 while not self.nav_stop.is_set():
                     cur_lat = self.aq.get("PLANE_LATITUDE")
@@ -237,6 +294,9 @@ class FlightController:
 
                     dist_nm = _haversine_nm(cur_lat, cur_lon, tgt_lat, tgt_lon)
                     alt_err = tgt_alt - cur_alt
+
+                    if abs(alt_err) < 100 and abs(dist_nm) < 3:
+                        self._ev("AP_ALT_HOLD_ON")
 
                     if dist_nm < 0.3:
                         self._status(f"✅ Nokta {idx} tamamlandı")
