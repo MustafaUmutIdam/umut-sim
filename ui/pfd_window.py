@@ -18,6 +18,12 @@ class PFDWindow:
     BANK_SCALE_R = 60        # yarıçap (px)
     BANK_SCALE_CY = 60       # ölçek merkezinin y konumu (px)
 
+    # Pitch merdiveni (ladder) ayarları
+    PITCH_LADDER_DEGS = list(range(-30, 35, 5))  # -30° .. +30° arası her 5°
+
+    # Görsel ölçekler
+    PITCH_PX_PER_DEG = 4.0   # Dik açı başına piksel kayma
+
     # ────────────────────────────────────────────────────────────────────
     def __init__(self, root: tk.Tk, flight_ctrl):
         self.flight = flight_ctrl
@@ -42,6 +48,15 @@ class PFDWindow:
         # Dinamik olarak güncellenecek bank ölçeği elemanlarının id listeleri
         self.bank_scale_lines = []
         self.bank_scale_labels = []
+
+        # Pitch ladder öğeleri {deg: (line_id, [text_ids])}
+        self.pitch_ladder_items = {}
+
+        # Önceki durum için önbellekler
+        self._prev_bank_deg = None
+
+        # Sabit (değişmeyecek) değerler
+        self.pitch_px_per_deg = self.PITCH_PX_PER_DEG
 
         # Sabit uçak sembolü eleman id'lerini saklamak için
         self.aircraft_symbol_elements = []
@@ -107,6 +122,9 @@ class PFDWindow:
         self.horizon_line = self.cv.create_line(
             self.center_left, self.H / 2, self.center_right, self.H / 2,
             fill="yellow", width=3)
+
+        # ░░░ Pitch merdiveni ░░░
+        self._create_pitch_ladder()
 
         # ░░░ Sabit uçak sembolü ░░░
         wing = 40
@@ -178,6 +196,53 @@ class PFDWindow:
                                          fill="white", font=("Consolas", 8)))
 
     # ────────────────────────────────────────────────────────────────────
+    #   Pitch ladder oluşturma ve güncelleme
+    # ────────────────────────────────────────────────────────────────────
+    def _create_pitch_ladder(self):
+        """Pitch merdiveni yatay çizgilerini ve etiketleri oluşturarak item id'lerini saklar."""
+        cx = self.center_cx
+        for deg in self.PITCH_LADDER_DEGS:
+            if deg == 0:
+                # Horizon çizgisi zaten var
+                continue
+            is_major = deg % 10 == 0
+            line_len = 120 if is_major else 80
+            y_offset = -deg * self.pitch_px_per_deg
+            y = self.center_cy + y_offset
+            x1 = cx - line_len / 2
+            x2 = cx + line_len / 2
+            line_id = self.cv.create_line(x1, y, x2, y, fill="white", width=2, tag="pitch_ladder")
+            text_ids = []
+            if is_major:
+                txt = str(abs(deg))
+                text_ids.append(self.cv.create_text(x1 - 22, y, text=txt, fill="white", font=("Consolas", 8), tag="pitch_ladder"))
+                text_ids.append(self.cv.create_text(x2 + 22, y, text=txt, fill="white", font=("Consolas", 8), tag="pitch_ladder"))
+            self.pitch_ladder_items[deg] = (line_id, text_ids)
+
+    def _update_pitch_ladder(self, pitch_deg: float, rot_rad: float):
+        """Pitch ladder öğelerinin konumunu günceller.
+        Y konumu: center_cy - (pitch - ladder_deg) * px/deg
+        """
+        cx = self.center_cx
+        for deg, (line_id, text_ids) in self.pitch_ladder_items.items():
+            # Yeni temel koordinatlar (döndürülmeden)
+            is_major = deg % 10 == 0
+            line_len = 120 if is_major else 80
+            y = self.center_cy - (pitch_deg - deg) * self.pitch_px_per_deg
+            x1 = cx - line_len / 2
+            x2 = cx + line_len / 2
+            # Döndür
+            p1x, p1y = self._rotate_point(x1, y, cx, self.center_cy, rot_rad)
+            p2x, p2y = self._rotate_point(x2, y, cx, self.center_cy, rot_rad)
+            self.cv.coords(line_id, p1x, p1y, p2x, p2y)
+            # Etiketler
+            if text_ids:
+                lx, ly = self._rotate_point(x1 - 22, y, cx, self.center_cy, rot_rad)
+                rx, ry = self._rotate_point(x2 + 22, y, cx, self.center_cy, rot_rad)
+                self.cv.coords(text_ids[0], lx, ly)
+                self.cv.coords(text_ids[1], rx, ry)
+
+    # ────────────────────────────────────────────────────────────────────
     def _loop(self):
         dt = 1 / self.UPDATE_HZ
         while not self._stop.is_set():
@@ -208,12 +273,10 @@ class PFDWindow:
         self.cv.itemconfigure(self.hdg_text, text=f"HDG {int(hdg)%360:03d}°")
 
         # Ufuk geometrisi
-        pitch_px_per_deg = 4.0
-        dy_pitch = -pitch * pitch_px_per_deg
+        dy_pitch = -pitch * self.pitch_px_per_deg
         ai_cx, ai_cy = self.center_cx, self.center_cy
 
-        bank_mul = 3.0  # Görsel etkiyi artır
-        rot_rad = math.radians(-bank * bank_mul)
+        rot_rad = math.radians(-bank)
         BIG = 2000
         eff_horiz_y = ai_cy + dy_pitch
 
@@ -248,8 +311,13 @@ class PFDWindow:
         h2x, h2y = self._rotate_point(self.center_right, eff_horiz_y, ai_cx, ai_cy, rot_rad)
         self.cv.coords(self.horizon_line, h1x, h1y, h2x, h2y)
 
-        # Bank ölçeği
-        self._draw_bank_scale(math.radians(bank))
+        # Bank ölçeği (yalnızca anlamlı değişimde yeniden çiz)
+        if self._prev_bank_deg is None or abs(bank - self._prev_bank_deg) > 0.5:
+            self._draw_bank_scale(math.radians(bank))
+            self._prev_bank_deg = bank
+
+        # Pitch merdiveni
+        self._update_pitch_ladder(pitch, rot_rad)
 
         # ─ Katman sırası ayarla ─
         # Gökyüzü ve toprak en arkada kalsın
@@ -270,7 +338,10 @@ class PFDWindow:
         # Heading işaretleri
         self.cv.tag_raise("heading_markers")
 
-        # Sabit uçak sembolü
+        # Pitch ladder çizgileri (bank ölçeğinden önce, uçak sembolünün altında olmayacak şekilde)
+        self.cv.tag_raise("pitch_ladder")
+
+        # Sabit uçak sembolü her zaman en üstte kalsın
         for elem in self.aircraft_symbol_elements:
             self.cv.tag_raise(elem)
 
