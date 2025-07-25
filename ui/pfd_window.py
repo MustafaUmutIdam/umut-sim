@@ -282,3 +282,128 @@ class PFDWindow:
     def _on_close(self):
         self._stop.set()
         self.top.destroy()
+
+
+# ────────────────────────────────────────────────────────────────────
+# PyQt5 tabanlı modern PFD (taslak)
+# ────────────────────────────────────────────────────────────────────
+from PyQt5 import QtWidgets, QtGui, QtCore
+import math
+
+class PFDWindowQt(QtWidgets.QWidget):
+    """Modern, gerçekçi PFD (Primary Flight Display) - PyQt5 ile."""
+    UPDATE_HZ = 30
+    def __init__(self, aq, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Gelişmiş PFD (PyQt5)")
+        self.setFixedSize(640, 480)
+        self.aq = aq
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.update)
+        self.timer.start(int(1000/self.UPDATE_HZ))
+        self.show()
+
+    def paintEvent(self, event):
+        qp = QtGui.QPainter(self)
+        qp.setRenderHint(QtGui.QPainter.Antialiasing)
+        self.draw_pfd(qp)
+
+    def draw_pfd(self, qp):
+        W, H = self.width(), self.height()
+        cx, cy = W//2, H//2
+        # --- Uçuş verileri ---
+        aq = self.aq
+        ias = aq.get("AIRSPEED_INDICATED") or 0.0 if self.aq else 0.0
+        alt = aq.get("PLANE_ALTITUDE") or 0.0 if self.aq else 0.0
+        vs = aq.get("VERTICAL_SPEED") or 0.0 if self.aq else 0.0
+        hdg = aq.get("PLANE_HEADING_DEGREES_TRUE") or 0.0 if self.aq else 0.0
+        pitch = aq.get("PLANE_PITCH_DEGREES") or 0.0 if self.aq else 0.0
+        bank = aq.get("PLANE_BANK_DEGREES") or 0.0 if self.aq else 0.0
+
+        # --- Yapay ufuk ---
+        sky_color = QtGui.QColor(0,170,255)
+        gnd_color = QtGui.QColor(136,84,0)
+        horizon_y = cy - pitch*4
+        bank_rad = math.radians(bank)
+        # Gökyüzü
+        qp.save()
+        qp.translate(cx, cy)
+        qp.rotate(-bank)
+        qp.setBrush(sky_color)
+        qp.setPen(QtCore.Qt.NoPen)
+        qp.drawRect(int(-W), int(-H), int(2*W), int(horizon_y-cy))
+        # Toprak
+        qp.setBrush(gnd_color)
+        qp.drawRect(int(-W), int(horizon_y-cy), int(2*W), int(H))
+        # Ufuk çizgisi
+        qp.setPen(QtGui.QPen(QtGui.QColor("yellow"), 3))
+        qp.drawLine(int(-W), int(horizon_y-cy), int(W), int(horizon_y-cy))
+        qp.restore()
+
+        # --- Bank ölçeği ---
+        qp.save()
+        qp.translate(cx, cy-100)
+        qp.rotate(-bank)
+        qp.setPen(QtGui.QPen(QtGui.QColor("white"), 2))
+        for deg in [-60,-45,-30,-20,-10,0,10,20,30,45,60]:
+            angle = math.radians(deg)
+            r1 = 60
+            r2 = 60-12 if abs(deg) in (30,60) else 60-8
+            x1 = r1*math.sin(angle)
+            y1 = -r1*math.cos(angle)
+            x2 = r2*math.sin(angle)
+            y2 = -r2*math.cos(angle)
+            qp.drawLine(int(x1),int(y1),int(x2),int(y2))
+            if abs(deg) in (30,60):
+                qp.setFont(QtGui.QFont("Consolas",8))
+                qp.drawText(int(1.2*x1)-8,int(1.2*y1)+4,str(abs(deg)))
+        qp.restore()
+
+        # --- Hız şeridi (sol) ---
+        qp.setPen(QtGui.QPen(QtGui.QColor("white"), 2))
+        qp.setBrush(QtGui.QColor(30,30,30,220))
+        qp.drawRect(20,cy-70,50,140)
+        qp.setFont(QtGui.QFont("Consolas",14,QtGui.QFont.Bold))
+        qp.setPen(QtGui.QColor("lime"))
+        qp.drawText(25,cy+10,f"{ias:5.0f}")
+        qp.setFont(QtGui.QFont("Consolas",8))
+        for i in range(-2,3):
+            val = ias + i*10
+            qp.drawText(55,cy+10-i*28,f"{val:3.0f}")
+
+        # --- İrtifa şeridi (sağ) ---
+        qp.setPen(QtGui.QPen(QtGui.QColor("white"), 2))
+        qp.setBrush(QtGui.QColor(30,30,30,220))
+        qp.drawRect(W-70,cy-70,50,140)
+        qp.setFont(QtGui.QFont("Consolas",14,QtGui.QFont.Bold))
+        qp.setPen(QtGui.QColor("cyan"))
+        qp.drawText(W-65,cy+10,f"{alt:6.0f}")
+        qp.setFont(QtGui.QFont("Consolas",8))
+        for i in range(-2,3):
+            val = alt + i*100
+            qp.drawText(W-35,cy+10-i*28,f"{val:5.0f}")
+
+        # --- Heading bandı (alt) ---
+        qp.setPen(QtGui.QPen(QtGui.QColor("white"), 2))
+        qp.setBrush(QtGui.QColor(30,30,30,220))
+        qp.drawRect(cx-80,H-60,160,40)
+        qp.setFont(QtGui.QFont("Consolas",16,QtGui.QFont.Bold))
+        qp.setPen(QtGui.QColor("white"))
+        qp.drawText(cx-30,H-30,f"{int(hdg)%360:03d}°")
+        # Heading işaretleri
+        qp.setFont(QtGui.QFont("Consolas",8))
+        for i in range(-3,4):
+            val = (hdg + i*10)%360
+            qp.drawText(cx+i*40-8,H-40,f"{int(val):03d}")
+        # --- Uçak sembolü (merkez) ---
+        qp.setPen(QtGui.QPen(QtGui.QColor("white"), 3))
+        qp.drawLine(cx-30,cy,cx-5,cy)
+        qp.drawLine(cx+5,cy,cx+30,cy)
+        qp.drawRect(cx-5,cy-5,10,10)
+        # --- VS göstergesi (sağda küçük) ---
+        qp.setFont(QtGui.QFont("Consolas",10))
+        qp.setPen(QtGui.QColor("magenta"))
+        qp.drawText(W-65,cy-80,f"VS {vs: .0f}")
+        qp.end()
+
+# Not: Bu class'ı kullanmak için bir PyQt5 uygulaması başlatılmalı ve aq (veri kaynağı) ile örneklenmeli.

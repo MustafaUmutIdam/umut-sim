@@ -14,7 +14,7 @@ num_points = 600
 R = 6371000
 
 # Sabit heading: batı (270 derece)
-heading =90
+heading = 240
 
 # Sahte kanat açısı üretimi
 def random_attitude():
